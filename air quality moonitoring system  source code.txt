@@ -1,0 +1,460 @@
+/*
+ * ======================================================================================
+ * ESP32-C3 Super Mini - Environmental & Air Quality Monitor
+ * ======================================================================================
+ * Hardware Connections (Matching the Breadboard Diagram):
+ * 
+ * 1. 0.96" SSD1306 OLED Display (I2C):
+ *    - VCC  -> 5V (or 3.3V)
+ *    - GND  -> GND
+ *    - SDA  -> ESP32-C3 GPIO0
+ *    - SCL  -> ESP32-C3 GPIO1
+ * 
+ * 2. Adafruit BME280 Sensor (Hardware SPI):
+ *    - VIN  -> 3.3V
+ *    - GND  -> GND
+ *    - SCK  -> ESP32-C3 GPIO4 (SPI Clock)
+ *    - SDO  -> ESP32-C3 GPIO5 (MISO - Master In Slave Out)
+ *    - SDI  -> ESP32-C3 GPIO6 (MOSI - Master Out Slave In)
+ *    - CS   -> ESP32-C3 GPIO7 (Chip Select)
+ * 
+ * 3. MQ-2 Gas & Smoke Sensor (Analog):
+ *    - VCC  -> 5V
+ *    - GND  -> GND
+ *    - AO   -> Voltage Divider (R1/R2) -> ESP32-C3 GPIO3 (ADC1_CH3)
+ * ======================================================================================
+ */
+
+#include <Wire.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include <math.h>
+
+// --------------------------------------------------------------------------------------
+// Pin Assignments (ESP32-C3 Super Mini)
+// --------------------------------------------------------------------------------------
+#define PIN_OLED_SDA     0   // GPIO0 -> OLED SDA
+#define PIN_OLED_SCL     1   // GPIO1 -> OLED SCL
+
+#define PIN_MQ2_AO       3   // GPIO3 (ADC1_CH3) -> MQ-2 Analog Out (via divider)
+
+#define PIN_BME_SCK      4   // GPIO4 -> BME280 SCK
+#define PIN_BME_SDO      5   // GPIO5 -> BME280 SDO (MISO)
+#define PIN_BME_SDI      6   // GPIO6 -> BME280 SDI (MOSI)
+#define PIN_BME_CS       7   // GPIO7 -> BME280 CS
+
+// --------------------------------------------------------------------------------------
+// OLED Display Configuration
+// --------------------------------------------------------------------------------------
+#define SCREEN_WIDTH     128
+#define SCREEN_HEIGHT    64
+#define OLED_RESET       -1
+#define SCREEN_ADDRESS   0x3C   // Default 0.96" I2C OLED address
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// --------------------------------------------------------------------------------------
+// BME280 Sensor Configuration (SPI)
+// --------------------------------------------------------------------------------------
+#define SEALEVELPRESSURE_HPA (1013.25)
+Adafruit_BME280 bme(PIN_BME_CS, &SPI);
+bool bme_detected = false;
+
+// --------------------------------------------------------------------------------------
+// Sensor Data & Calibration Variables
+// --------------------------------------------------------------------------------------
+float temperature_c = 0.0;
+float temperature_f = 0.0;
+float humidity = 0.0;
+float pressure_hpa = 0.0;
+float altitude_m = 0.0;
+
+int   mq2_raw_adc = 0;
+float mq2_voltage = 0.0;
+float co2_equiv_ppm = 400.0;
+float gas_ppm = 0.0;
+String air_quality_status = "CLEAN";
+
+// Baseline calibration for MQ-2 in clean air
+float mq2_baseline_adc = 400.0;
+
+// UI Timing & Display Modes
+unsigned long last_sensor_read_time = 0;
+unsigned long last_page_switch_time = 0;
+const unsigned long SENSOR_INTERVAL = 500;   // Update sensor readings every 500ms
+const unsigned long PAGE_INTERVAL   = 4000;  // Cycle through display screens every 4s
+uint8_t current_screen = 0;                  // 0: Overview, 1: Gas & Air Quality, 2: Climate & Weather
+bool heartbeat_state = false;
+
+// --------------------------------------------------------------------------------------
+// Helper: Draw Degree Symbol (°)
+// --------------------------------------------------------------------------------------
+void drawDegree(int x, int y) {
+  display.drawCircle(x, y, 1, SSD1306_WHITE);
+}
+
+// --------------------------------------------------------------------------------------
+// Read & Filter MQ-2 Gas Sensor
+// --------------------------------------------------------------------------------------
+void readMQ2() {
+  // Multi-sample average (16 samples) for noise suppression on ADC
+  long sum = 0;
+  for (int i = 0; i < 16; i++) {
+    sum += analogRead(PIN_MQ2_AO);
+    delayMicroseconds(200);
+  }
+  mq2_raw_adc = sum / 16;
+
+  // ESP32-C3 ADC has 12-bit resolution (0 - 4095) with 3.3V reference
+  mq2_voltage = (mq2_raw_adc / 4095.0) * 3.3;
+
+  // Approximate CO2-equivalent level (PPM):
+  // Outdoor fresh air baseline is ~400-420 ppm.
+  // As smoke, CO, or combustion gases increase, the reading scales upwards.
+  float deviation = (float)(mq2_raw_adc - mq2_baseline_adc);
+  if (deviation < 0) deviation = 0;
+
+  co2_equiv_ppm = 400.0 + (deviation * 1.85);
+  gas_ppm = (deviation * 1.2);
+
+  // Determine Air Quality Category
+  if (co2_equiv_ppm < 600.0) {
+    air_quality_status = "EXCELLENT";
+  } else if (co2_equiv_ppm < 900.0) {
+    air_quality_status = "GOOD";
+  } else if (co2_equiv_ppm < 1400.0) {
+    air_quality_status = "MODERATE";
+  } else if (co2_equiv_ppm < 2000.0) {
+    air_quality_status = "POOR";
+  } else {
+    air_quality_status = "ALERT! DANGER";
+  }
+}
+
+// --------------------------------------------------------------------------------------
+// Read BME280 Climate Sensor
+// --------------------------------------------------------------------------------------
+void readBME280() {
+  if (!bme_detected) return;
+
+  temperature_c = bme.readTemperature();
+  temperature_f = (temperature_c * 9.0 / 5.0) + 32.0;
+  humidity      = bme.readHumidity();
+  pressure_hpa  = bme.readPressure() / 100.0F;
+  altitude_m    = bme.readAltitude(SEALEVELPRESSURE_HPA);
+}
+
+// --------------------------------------------------------------------------------------
+// OLED Screen 0: Master Overview Dashboard
+// --------------------------------------------------------------------------------------
+void drawScreenOverview() {
+  display.clearDisplay();
+
+  // Inverted Header
+  display.fillRect(0, 0, 128, 11, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(3, 2);
+  display.print("AIR MONITOR  [1/3]");
+
+  // Heartbeat Indicator
+  if (heartbeat_state) {
+    display.fillRect(118, 3, 5, 5, SSD1306_BLACK);
+  } else {
+    display.drawRect(118, 3, 5, 5, SSD1306_BLACK);
+  }
+
+  // Body Metrics
+  display.setTextColor(SSD1306_WHITE);
+
+  // Line 1: Temperature
+  display.setCursor(2, 15);
+  display.print("Temp: ");
+  if (bme_detected) {
+    display.print(temperature_c, 1);
+    display.print(" ");
+    drawDegree(display.getCursorX() + 1, 16);
+    display.setCursor(display.getCursorX() + 4, 15);
+    display.print("C");
+  } else {
+    display.print("--.- C");
+  }
+
+  // Line 2: Humidity
+  display.setCursor(2, 25);
+  display.print("Hum : ");
+  if (bme_detected) {
+    display.print(humidity, 1);
+    display.print(" %");
+  } else {
+    display.print("--.- %");
+  }
+
+  // Line 3: Pressure
+  display.setCursor(2, 35);
+  display.print("Pres: ");
+  if (bme_detected) {
+    display.print(pressure_hpa, 1);
+    display.print(" hPa");
+  } else {
+    display.print("----.- hPa");
+  }
+
+  // Line 4: CO2 / Gas Level
+  display.setCursor(2, 45);
+  display.print("CO2 : ");
+  display.print((int)co2_equiv_ppm);
+  display.print(" ppm");
+
+  // Footer Divider Line & Status Badge
+  display.drawLine(0, 54, 127, 54, SSD1306_WHITE);
+  display.setCursor(2, 56);
+  display.print("Air : ");
+  display.print(air_quality_status);
+
+  display.display();
+}
+
+// --------------------------------------------------------------------------------------
+// OLED Screen 1: Gas & Air Quality Detail
+// --------------------------------------------------------------------------------------
+void drawScreenGasDetail() {
+  display.clearDisplay();
+
+  // Inverted Header
+  display.fillRect(0, 0, 128, 11, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(3, 2);
+  display.print("GAS & AIR Q. [2/3]");
+
+  if (heartbeat_state) display.fillRect(118, 3, 5, 5, SSD1306_BLACK);
+  else display.drawRect(118, 3, 5, 5, SSD1306_BLACK);
+
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(2, 15);
+  display.print("CO2 Equiv: ");
+  display.print((int)co2_equiv_ppm);
+  display.print(" ppm");
+
+  display.setCursor(2, 25);
+  display.print("Gas PPM  : ");
+  display.print((int)gas_ppm);
+  display.print(" ppm");
+
+  display.setCursor(2, 35);
+  display.print("Sensor V : ");
+  display.print(mq2_voltage, 2);
+  display.print(" V");
+
+  display.setCursor(2, 45);
+  display.print("ADC Raw  : ");
+  display.print(mq2_raw_adc);
+  display.print(" / 4095");
+
+  display.drawLine(0, 54, 127, 54, SSD1306_WHITE);
+  display.setCursor(2, 56);
+  display.print("Status   : ");
+  display.print(air_quality_status);
+
+  display.display();
+}
+
+// --------------------------------------------------------------------------------------
+// OLED Screen 2: Climate & Weather Detail
+// --------------------------------------------------------------------------------------
+void drawScreenClimateDetail() {
+  display.clearDisplay();
+
+  // Inverted Header
+  display.fillRect(0, 0, 128, 11, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(3, 2);
+  display.print("CLIMATE DATA [3/3]");
+
+  if (heartbeat_state) display.fillRect(118, 3, 5, 5, SSD1306_BLACK);
+  else display.drawRect(118, 3, 5, 5, SSD1306_BLACK);
+
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(2, 15);
+  display.print("Temp C: ");
+  if (bme_detected) display.print(temperature_c, 2); else display.print("--.--");
+  display.print(" C");
+
+  display.setCursor(2, 25);
+  display.print("Temp F: ");
+  if (bme_detected) display.print(temperature_f, 1); else display.print("--.-");
+  display.print(" F");
+
+  display.setCursor(2, 35);
+  display.print("Humid : ");
+  if (bme_detected) display.print(humidity, 1); else display.print("--.-");
+  display.print(" % RH");
+
+  display.setCursor(2, 45);
+  display.print("Altit : ");
+  if (bme_detected) display.print(altitude_m, 1); else display.print("--.-");
+  display.print(" m");
+
+  display.drawLine(0, 54, 127, 54, SSD1306_WHITE);
+  display.setCursor(2, 56);
+  display.print("Pres: ");
+  if (bme_detected) display.print(pressure_hpa, 1); else display.print("----.-");
+  display.print(" hPa");
+
+  display.display();
+}
+
+// --------------------------------------------------------------------------------------
+// Print Readings to Serial Monitor (115200 Baud)
+// --------------------------------------------------------------------------------------
+void printSerialData() {
+  Serial.print("[DATA] Temp: ");
+  Serial.print(temperature_c, 1);
+  Serial.print(" °C | Hum: ");
+  Serial.print(humidity, 1);
+  Serial.print(" % | Pres: ");
+  Serial.print(pressure_hpa, 1);
+  Serial.print(" hPa | CO2: ");
+  Serial.print((int)co2_equiv_ppm);
+  Serial.print(" ppm | Gas: ");
+  Serial.print((int)gas_ppm);
+  Serial.print(" ppm | MQ2 ADC: ");
+  Serial.print(mq2_raw_adc);
+  Serial.print(" (");
+  Serial.print(mq2_voltage, 2);
+  Serial.print("V) | Air: ");
+  Serial.println(air_quality_status);
+}
+
+// --------------------------------------------------------------------------------------
+// Setup Function
+// --------------------------------------------------------------------------------------
+void setup() {
+  // Initialize USB-CDC Serial communication
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println();
+  Serial.println("==================================================");
+  Serial.println("  ESP32-C3 Super Mini - Environmental Monitor     ");
+  Serial.println("==================================================");
+
+  // 1. Initialize I2C for SSD1306 OLED (SDA=0, SCL=1)
+  Wire.begin(PIN_OLED_SDA, PIN_OLED_SCL);
+  bool oled_ok = display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
+  if (!oled_ok) {
+    oled_ok = display.begin(SSD1306_SWITCHCAPVCC, 0x3D);
+  }
+
+  if (oled_ok) {
+    Serial.println("[OK] OLED Display initialized.");
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(10, 8);
+    display.println("ESP32-C3 SUPER MINI");
+    display.setCursor(14, 22);
+    display.println("ENVIRONMENT MONITOR");
+    display.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+    display.setCursor(12, 42);
+    display.println("Initializing sensors..");
+    display.display();
+  } else {
+    Serial.println("[WARN] OLED Display not detected at 0x3C or 0x3D.");
+  }
+
+  // 2. Initialize Hardware SPI for BME280 (SCK=4, MISO=5, MOSI=6, CS=7)
+  SPI.begin(PIN_BME_SCK, PIN_BME_SDO, PIN_BME_SDI, PIN_BME_CS);
+  bme_detected = bme.begin();
+
+  if (bme_detected) {
+    Serial.println("[OK] BME280 detected and initialized via SPI.");
+  } else {
+    Serial.println("[WARN] BME280 not found on Hardware SPI. Attempting fallback...");
+    Adafruit_BME280 bme_sw(PIN_BME_CS, PIN_BME_SDI, PIN_BME_SDO, PIN_BME_SCK);
+    bme_detected = bme_sw.begin();
+    if (bme_detected) {
+      Serial.println("[OK] BME280 initialized via Software SPI.");
+    } else {
+      Serial.println("[ERROR] BME280 sensor not detected. Verify SPI connections.");
+    }
+  }
+
+  // 3. Configure MQ-2 Analog Input Pin
+  pinMode(PIN_MQ2_AO, INPUT);
+  analogReadResolution(12); // 12-bit ADC (0 - 4095)
+
+  // 4. Quick Baseline Calibration (samples clean room air for 3 seconds)
+  if (oled_ok) {
+    display.fillRect(10, 40, 108, 18, SSD1306_BLACK);
+    display.setCursor(18, 42);
+    display.println("Calibrating MQ-2...");
+    display.display();
+  }
+
+  long calib_sum = 0;
+  for (int i = 0; i < 30; i++) {
+    calib_sum += analogRead(PIN_MQ2_AO);
+    delay(100);
+  }
+  mq2_baseline_adc = calib_sum / 30.0;
+  if (mq2_baseline_adc < 100) mq2_baseline_adc = 350.0; // Sensible floor
+
+  Serial.print("[OK] MQ-2 Initial Clean Air Baseline: ");
+  Serial.println(mq2_baseline_adc);
+
+  if (oled_ok) {
+    display.fillRect(10, 40, 108, 18, SSD1306_BLACK);
+    display.setCursor(30, 42);
+    display.println("READY!");
+    display.display();
+    delay(800);
+  }
+
+  Serial.println("[INFO] System ready. Commencing monitoring loop.");
+}
+
+// --------------------------------------------------------------------------------------
+// Main Application Loop
+// --------------------------------------------------------------------------------------
+void loop() {
+  unsigned long current_time = millis();
+
+  // Read sensors every SENSOR_INTERVAL (500 ms)
+  if (current_time - last_sensor_read_time >= SENSOR_INTERVAL) {
+    last_sensor_read_time = current_time;
+    heartbeat_state = !heartbeat_state;
+
+    readMQ2();
+    readBME280();
+    printSerialData();
+
+    // Render active OLED screen
+    switch (current_screen) {
+      case 0:
+        drawScreenOverview();
+        break;
+      case 1:
+        drawScreenGasDetail();
+        break;
+      case 2:
+        drawScreenClimateDetail();
+        break;
+      default:
+        drawScreenOverview();
+        break;
+    }
+  }
+
+  // Cycle screen pages every PAGE_INTERVAL (4 seconds)
+  if (current_time - last_page_switch_time >= PAGE_INTERVAL) {
+    last_page_switch_time = current_time;
+    current_screen = (current_screen + 1) % 3;
+  }
+}
